@@ -1,0 +1,285 @@
+import { useEffect, useMemo, useState } from 'react';
+import { supabase } from '../lib/supabase';
+import { useAuth } from '../context/AuthContext';
+import { composition, fmtMoney, symFor, snapshotValue } from '../lib/wealth';
+import { getFinancialSummary, currentMonth, defaultFinancialScope } from '../lib/financialSummary';
+import { DataStatus } from '../components/DataStatus';
+import { PageIntro, MiloAvatar, MiloCoach } from '../components/Milo';
+import {
+  ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip, CartesianGrid, Legend, ReferenceLine, ReferenceDot,
+} from 'recharts';
+
+const PROPERTY_CLASSES = new Set(['property', 'commercial_property', 'land']);
+
+// 20-year monthly simulation off the user's real composition.
+// Liabilities amortise individually: interest-aware when rate + payment exist.
+function totalDebt(debts) { return debts.reduce((a, d) => a + d.balance, 0); }
+function stepDebts(debts) {
+  for (const d of debts) {
+    if (d.balance <= 0) continue;
+    if (d.rate != null && d.payment > 0) {
+      d.balance = Math.max(0, d.balance * (1 + d.rate / 1200) - d.payment);  // interest-aware
+    } else if (d.payment > 0) {
+      d.balance = Math.max(0, d.balance - d.payment);                        // straight-line approximation
+    }
+    // no payment data: balance held constant (clearly approximate)
+  }
+}
+function project({ investable, propertyWealth, debts0, monthly, lump, retPct, propPct, inflPct }) {
+  const rm = Math.pow(1 + retPct / 100, 1 / 12) - 1;
+  const pm = Math.pow(1 + propPct / 100, 1 / 12) - 1;
+  const im = Math.pow(1 + inflPct / 100, 1 / 12) - 1;
+  const debts = debts0.map((d) => ({ ...d }));
+  let inv = investable + lump, prop = propertyWealth;
+  const initialDebt = totalDebt(debts);
+  const startGross = investable + propertyWealth + lump;
+  const startNW = startGross - initialDebt;
+  let totalContrib = 0;
+  const rows = [{ year: 0, nominal: Math.round(startNW), real: Math.round(startNW), startingWealth: Math.round(startNW), contributions: 0, marketGrowth: 0, debtPaydown: 0, growth: 0 }];
+  for (let m = 1; m <= 240; m++) {
+    inv = inv * (1 + rm) + monthly;
+    prop = prop * (1 + pm);
+    stepDebts(debts);
+    const debt = totalDebt(debts);
+    totalContrib += monthly;
+    if (m % 12 === 0) {
+      const nominal = inv + prop - debt;
+      const deflator = Math.pow(1 + im, m);
+      const marketGrowth = (inv + prop) - startGross - totalContrib;
+      const debtPaydown = initialDebt - debt;
+      rows.push({
+        year: m / 12,
+        nominal: Math.round(nominal),
+        real: Math.round(nominal / deflator),
+        startingWealth: Math.round(startNW),
+        contributions: Math.round(totalContrib),
+        marketGrowth: Math.round(marketGrowth),
+        debtPaydown: Math.round(debtPaydown),
+        growth: Math.round(marketGrowth + debtPaydown),
+      });
+    }
+  }
+  return rows;
+}
+
+export default function Projector() {
+  const { user, profile } = useAuth();
+  const base = profile?.currency || 'GBP';
+  const sym = symFor(base);
+  const f = (n) => fmtMoney(n, sym);
+  const scope = defaultFinancialScope(profile);
+
+  const [src, setSrc] = useState(null);
+  const [monthly, setMonthly] = useState(null);
+  const [lump, setLump] = useState(0);
+  const [ret, setRet] = useState(7);
+  const [prop, setProp] = useState(3);
+  const [infl, setInfl] = useState(2.5);
+  const [showReal, setShowReal] = useState(false);
+  const [err, setErr] = useState('');
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      setErr('');
+      try {
+        const month = currentMonth();
+        const [snaps, assets, liabs, fin] = await Promise.all([
+          supabase.from('investment_snapshots').select('asset_type, total_value, converted_total, snapshot_date')
+            .eq('user_id', user.id).order('snapshot_date', { ascending: false }),
+          supabase.from('assets').select('*').eq('user_id', user.id).eq('is_active', true),
+          supabase.from('liabilities').select('amount, interest_rate, monthly_payment, scope').eq('user_id', user.id),
+          getFinancialSummary(user.id, month, { fallback: true, scope }),
+        ]);
+        const firstError = [snaps, assets, liabs].find((r)=>r.error)?.error;
+        if (firstError) throw firstError;
+        const latestMap = {};
+        for (const row of snaps.data || []) if (!latestMap[row.asset_type]) latestMap[row.asset_type] = row;
+        const latest = Object.values(latestMap);
+        const aRows = assets.data || [];
+        const scopedLiabs = (liabs.data || []).filter((l)=>(l.scope || 'household')===scope);
+        const comp = composition(aRows, latest, scopedLiabs);
+        const propertyWealth = aRows.filter((a) => PROPERTY_CLASSES.has(a.asset_class))
+          .reduce((sum, a) => sum + Number(a.converted_value || 0), 0)
+          + latest.filter((row) => PROPERTY_CLASSES.has(row.asset_type)).reduce((sum, row) => sum + snapshotValue(row), 0);
+        const investable = comp.gross - propertyWealth;
+        const income = fin.totalIncome;
+        const expenses = fin.totalExpenses;
+        const debts0 = scopedLiabs.map((l) => ({
+          balance: Number(l.amount || 0), rate: l.interest_rate != null ? Number(l.interest_rate) : null,
+          payment: Number(l.monthly_payment || 0),
+        }));
+        const debtApprox = debts0.some((d) => d.rate == null || !d.payment);
+        const latestDate = latest.map((x)=>x.snapshot_date).sort().at(-1) || null;
+        if (alive) {
+          setSrc({ comp, investable, propertyWealth, netSavings: Math.max(0, income - expenses), debts0, debtApprox, budgetMonth: fin.month, budgetFallback: fin.isFallback, latestDate });
+          setMonthly(Math.max(0, Math.round(income - expenses)));
+        }
+      } catch(e) { if (alive) setErr(e.message || 'Could not build the projection.'); }
+    })();
+    return ()=>{alive=false;};
+  }, [user.id, scope]);
+
+  const scenarios = useMemo(() => {
+    if (!src || monthly === null) return null;
+    const baseArgs = {
+      investable: src.investable, propertyWealth: src.propertyWealth,
+      debts0: src.debts0, monthly, lump: Number(lump) || 0, inflPct: infl,
+    };
+    return {
+      conservative: project({ ...baseArgs, retPct: ret - 2, propPct: Math.max(0, prop - 1.5) }),
+      base: project({ ...baseArgs, retPct: ret, propPct: prop }),
+      aggressive: project({ ...baseArgs, retPct: ret + 2, propPct: prop + 1.5 }),
+    };
+  }, [src, monthly, lump, ret, prop, infl]);
+
+  if (err) return <div className="page page-wide"><div className="data-notice error-notice">{err}</div><button className="btn btn-primary" onClick={()=>window.location.reload()}>Try again</button></div>;
+  if (!src || !scenarios) return <div className="page page-wide"><div className="skeleton" style={{ height: 320 }} /></div>;
+
+  const key = showReal ? 'real' : 'nominal';
+  const chart = scenarios.base.map((r, i) => ({
+    year: r.year,
+    Conservative: scenarios.conservative[i][key],
+    Base: r[key],
+    Aggressive: scenarios.aggressive[i][key],
+  }));
+  const milestones = [3, 5, 10, 20].map((y) => ({ y, row: scenarios.base.find((r) => r.year === y) }));
+  const wealthMilestones = [250000,500000,1000000].map((target)=>({ target, row: scenarios.base.find((r)=>r[key] >= target) })).filter((x)=>x.row);
+  const finalBase = scenarios.base.at(-1)[key];
+
+  const Slider = ({ label, value, set, min, max, step, unit }) => (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '.68rem', color: 'var(--c-muted)', marginBottom: 4 }}>
+        <span className="t-label">{label}</span>
+        <span style={{ fontFamily: 'var(--font-display)', fontSize: '1rem', fontWeight: 600, color: 'var(--c-ink)' }}>{unit === sym ? f(value) : `${value}${unit}`}</span>
+      </div>
+      <input type="range" min={min} max={max} step={step} value={value} style={{ width: '100%', accentColor: 'var(--c-gold)' }}
+        onChange={(e) => set(Number(e.target.value))} />
+    </div>
+  );
+
+  return (
+    <div className="page page-wide">
+      <PageIntro eyebrow={`Built from your actual net worth of ${f(src.comp.netWorth)}`} title="Wealth Projector" subtitle="Explore how savings, returns, property and inflation may shape your future." />
+      <DataStatus month={src.budgetMonth} fallback={src.budgetFallback} updatedAt={src.latestDate}>Projection starts with live tracked wealth and budget month {src.budgetMonth}.</DataStatus>
+      <MiloCoach mode="future" eyebrow="Future Milo · scenario room"
+        title={`Your base path reaches ${f(finalBase)} in 20 years.`}
+        body="This is a scenario, not a promise. Change one assumption at a time and I’ll show how saving, returns, property and inflation affect the destination."
+        facts={[
+          { label:'Monthly system', value:f(monthly), detail:'Added to the projection each month' },
+          { label:'Base return', value:`${ret}%`, detail:'Annual investment assumption' },
+          { label:'Next milestone', value:wealthMilestones[0] ? f(wealthMilestones[0].target) : 'Adjust plan', detail:wealthMilestones[0] ? `Estimated around year ${wealthMilestones[0].row.year}` : 'Increase savings to reveal one' },
+        ]}
+        action={showReal ? 'Show nominal money' : "Show today’s money"} onAction={() => setShowReal(!showReal)}
+        motion="float" tone="future" compact />
+
+
+      {/* sliders */}
+      <div className="card" style={{ marginBottom: 18 }}>
+        <div className="grid g3" style={{ gap: 24 }}>
+          <Slider label="Monthly savings" value={monthly} set={setMonthly} min={0} max={Math.max(3000, src.netSavings * 2)} step={50} unit={sym} />
+          <Slider label="Investment return" value={ret} set={setRet} min={2} max={12} step={0.5} unit="% /yr" />
+          <Slider label="Property growth" value={prop} set={setProp} min={0} max={8} step={0.5} unit="% /yr" />
+          <Slider label="Inflation" value={infl} set={setInfl} min={0} max={8} step={0.5} unit="% /yr" />
+          <Slider label="One-time lump sum" value={lump} set={setLump} min={0} max={50000} step={500} unit={sym} />
+          <div style={{ alignSelf: 'end' }}>
+            <button className={'chip' + (showReal ? ' on' : '')} onClick={() => setShowReal(!showReal)}>
+              {showReal ? "Showing today's money (real)" : 'Show in today\u2019s money'}
+            </button>
+            <p style={{ fontSize: '.62rem', color: 'var(--c-muted)', marginTop: 6 }}>
+              Defaults: your current net savings rate, base assumptions. Debts amortise with interest where rate + payment are known{src.debtApprox && ' — some debts lack rate/payment, so debt projection is approximate'}.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <section className="projection-story">
+        <div className="projection-milo-card"><div><div className="milo-eyebrow">Milo’s projection</div><h2>At your current plan, your net worth could reach {f(finalBase)} in 20 years.</h2><p>This is an illustration, not a promise. Move the assumptions and Milo will show which decisions create the biggest difference.</p><div className="projection-pills"><span>{f(monthly)}/mo saved</span><span>{ret}% investment return</span><span>{prop}% property growth</span></div></div><MiloAvatar mode="future" size={180} motion="float" glow/></div>
+        <div className="projection-milestones"><div className="t-label">Future milestones</div>{wealthMilestones.length ? wealthMilestones.map((m)=><div key={m.target}><span>{f(m.target)}</span><strong>Year {m.row.year}</strong></div>) : <p className="t-small">Adjust monthly savings to reveal your next major milestone.</p>}</div>
+      </section>
+
+      {/* milestone cards */}
+      <div className="grid g4 projection-year-cards" style={{ marginBottom: 18 }}>
+        {milestones.map(({ y, row }) => (
+          <div key={y} className="card">
+            <div className="t-label">{y} years</div>
+            <div className="num-xl" style={{ fontSize: '1.8rem', marginTop: 4 }}>{f(row[key])}</div>
+            <div style={{ fontSize: '.68rem', color: 'var(--c-muted)' }}>
+              {f(scenarios.conservative.find((r) => r.year === y)[key])} – {f(scenarios.aggressive.find((r) => r.year === y)[key])}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* scenario chart */}
+      <div className="card projector-chart-card" style={{ marginBottom: 18 }}>
+        <div className="t-label" style={{ marginBottom: 10 }}>Scenario projection · {showReal ? "today's money" : 'nominal'}</div>
+        <ResponsiveContainer width="100%" height="100%">
+          <AreaChart data={chart} margin={{ left: 8, right: 8 }}>
+            <defs>
+              <linearGradient id="pb" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="#7657F5" stopOpacity={0.3} /><stop offset="100%" stopColor="#7657F5" stopOpacity={0.02} />
+              </linearGradient>
+            </defs>
+            <CartesianGrid stroke="#E7E3F2" strokeDasharray="2 4" vertical={false} />
+            <XAxis dataKey="year" tickFormatter={(v) => `${v}y`} tick={{ fontSize: 10, fontFamily: 'Arial' }} axisLine={false} tickLine={false} />
+            <YAxis tickFormatter={(v) => `${sym}${v >= 1e6 ? (v / 1e6).toFixed(1) + 'm' : (v / 1000).toFixed(0) + 'k'}`} tick={{ fontSize: 10, fontFamily: 'Arial' }} axisLine={false} tickLine={false} width={56} />
+            <Tooltip formatter={(v) => f(v)} labelFormatter={(v) => `Year ${v}`} />
+            <Legend wrapperStyle={{ fontSize: 11, fontFamily: 'Arial' }} />
+            {[3,5,10,20].map((y)=><ReferenceLine key={y} x={y} stroke="#D6D0E8" strokeDasharray="3 3" label={{value:`${y}Y`,position:'insideTop',fill:'#8A889B',fontSize:10}}/>)}
+            {[3,5,10,20].map((y)=>{const row=chart.find((r)=>r.year===y);return row?<ReferenceDot key={`dot-${y}`} x={y} y={row.Base} r={5} fill="#7657F5" stroke="#fff" strokeWidth={3}/>:null;})}
+            <Area type="monotone" dataKey="Conservative" stroke="#9A94AE" strokeWidth={1.5} fill="none" strokeDasharray="5 4" animationDuration={700} />
+            <Area type="monotone" dataKey="Base" stroke="#7657F5" strokeWidth={2.5} fill="url(#pb)" animationDuration={700} />
+            <Area type="monotone" dataKey="Aggressive" stroke="#47C9AA" strokeWidth={1.5} fill="none" strokeDasharray="5 4" animationDuration={700} />
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* contribution vs growth */}
+      <div className="card projector-chart-card projector-growth-card" style={{ marginBottom: 18 }}>
+        <div className="t-label" style={{ marginBottom: 10 }}>What builds your future wealth · base scenario (nominal)</div>
+        <ResponsiveContainer width="100%" height="100%">
+          <AreaChart data={scenarios.base} margin={{ left: 8, right: 8 }}>
+            <CartesianGrid stroke="#E7E3F2" strokeDasharray="2 4" vertical={false} />
+            <XAxis dataKey="year" tickFormatter={(v) => `${v}y`} tick={{ fontSize: 10, fontFamily: 'Arial' }} axisLine={false} tickLine={false} />
+            <YAxis tickFormatter={(v) => `${sym}${(v / 1000).toFixed(0)}k`} tick={{ fontSize: 10, fontFamily: 'Arial' }} axisLine={false} tickLine={false} width={56} />
+            <Tooltip formatter={(v) => f(v)} labelFormatter={(v) => `Year ${v}`} />
+            <Legend wrapperStyle={{ fontSize: 11, fontFamily: 'Arial' }} />
+            <Area type="monotone" dataKey="startingWealth" name="Starting net worth" stackId="1" stroke="#9A94AE" fill="#C8C4D6" fillOpacity={0.55} animationDuration={700} />
+            <Area type="monotone" dataKey="contributions" name="New contributions" stackId="1" stroke="#65A8FF" fill="#65A8FF" fillOpacity={0.58} animationDuration={700} />
+            <Area type="monotone" dataKey="marketGrowth" name="Market & property growth" stackId="1" stroke="#7657F5" fill="#7657F5" fillOpacity={0.58} animationDuration={700} />
+            <Area type="monotone" dataKey="debtPaydown" name="Debt paid down" stackId="1" stroke="#47C9AA" fill="#47C9AA" fillOpacity={0.58} animationDuration={700} />
+          </AreaChart>
+        </ResponsiveContainer>
+        <p style={{ fontSize: '.74rem', color: 'var(--c-muted)', marginTop: 8 }}>By year 20, the illustration separates your starting wealth, new monthly contributions, estimated market/property growth and debt paid down. This avoids presenting debt reduction as investment return.</p>
+      </div>
+
+      {/* year-by-year table */}
+      <div className="card">
+        <div className="t-label" style={{ marginBottom: 10 }}>Year by year · base scenario</div>
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '.76rem' }}>
+            <thead><tr>
+              {['Year', 'Nominal', "Today's money", 'New contributions', 'Growth + debt paydown'].map((h) => (
+                <th key={h} style={{ textAlign: 'right', padding: '8px 10px', borderBottom: '1px solid var(--c-border)', fontSize: '.6rem', letterSpacing: '.1em', textTransform: 'uppercase', color: 'var(--c-muted)' }}>{h}</th>))}
+            </tr></thead>
+            <tbody>
+              {scenarios.base.filter((r) => r.year > 0 && (r.year <= 5 || r.year % 2 === 0)).map((r) => (
+                <tr key={r.year} style={{ background: [3, 5, 10, 20].includes(r.year) ? 'var(--c-gold-light)' : 'transparent' }}>
+                  <td style={{ textAlign: 'right', padding: '7px 10px', fontWeight: 600 }}>{r.year}</td>
+                  <td style={{ textAlign: 'right', padding: '7px 10px', fontFamily: 'var(--font-display)', fontSize: '.95rem', fontWeight: 600 }}>{f(r.nominal)}</td>
+                  <td style={{ textAlign: 'right', padding: '7px 10px', color: 'var(--c-muted)' }}>{f(r.real)}</td>
+                  <td style={{ textAlign: 'right', padding: '7px 10px' }}>{f(r.contributions)}</td>
+                  <td style={{ textAlign: 'right', padding: '7px 10px', color: 'var(--c-green)' }}>{f(r.growth)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <p style={{ fontSize: '.62rem', color: 'var(--c-muted)', marginTop: 10 }}>
+          Projections are illustrations based on your stored data and the assumptions above — not predictions or financial advice. Markets do not move in straight lines.
+        </p>
+      </div>
+    </div>
+  );
+}
