@@ -58,7 +58,7 @@ function Shell({ children }) {
       <aside className="desktop-sidebar">
         <button className="side-brand" onClick={() => nav('/app')} aria-label="MoneyMilo home">
           <MiloLogo size={76} />
-          <span className="brand-word">Money<span>Milo</span><small className="brand-version">1.0</small></span>
+          <span className="brand-word">Money<span>Milo</span><small className="brand-version">1.1</small></span>
         </button>
 
         <div className="side-section-label">Your money</div>

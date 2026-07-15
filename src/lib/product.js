@@ -1,7 +1,7 @@
 export const PRODUCT = Object.freeze({
   name: 'MoneyMilo',
-  version: '1.0.0',
-  release: 'MoneyMilo 1.0',
+  version: '1.1.0',
+  release: 'MoneyMilo 1.1',
   siteUrl: 'https://moneymilo.netlify.app',
   supportEmail: 'support@moneymilo.app',
 });

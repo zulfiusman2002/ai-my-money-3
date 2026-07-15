@@ -1,10 +1,10 @@
-# MoneyMilo 1.0
+# MoneyMilo 1.1
 
 MoneyMilo is a responsive personal-finance companion for household and business money. It combines budgeting, investments, wider assets, liabilities, goals, net-worth tracking, projections, personalised learning and connected Ask Milo guidance.
 
-## MoneyMilo 1.0 release focus
+## MoneyMilo 1.1 release focus
 
-This release consolidates the V4.2 visual product into a stable 1.0 codebase rather than adding another version layer.
+This release upgrades Ask Milo into a structured AI answer experience while preserving the stable MoneyMilo 1.0 financial foundation.
 
 - Clear signup, verification and sign-in journey.
 - Adaptive onboarding for individuals, couples, households, businesses and combined profiles.
